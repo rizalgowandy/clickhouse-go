@@ -19,9 +19,12 @@ package clickhouse
 
 import (
 	"crypto/tls"
+	"net/url"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestParseDSN does not implement all use cases yet
@@ -449,6 +452,36 @@ func TestParseDSN(t *testing.T) {
 			},
 			"",
 		},
+		{
+			"client connection pool settings",
+			"clickhouse://127.0.0.1/test_database?max_open_conns=-1&max_idle_conns=0&conn_max_lifetime=1h",
+			&Options{
+				Protocol:        Native,
+				MaxOpenConns:    -1,
+				MaxIdleConns:    0,
+				ConnMaxLifetime: time.Hour,
+				Addr:            []string{"127.0.0.1"},
+				Settings:        Settings{},
+				Auth: Auth{
+					Database: "test_database",
+				},
+				scheme: "clickhouse",
+			},
+			"",
+		},
+		{
+			"http protocol with proxy",
+			"http://127.0.0.1/?http_proxy=http%3A%2F%2Fproxy.example.com%3A3128",
+			&Options{
+				Protocol:     HTTP,
+				TLS:          nil,
+				Addr:         []string{"127.0.0.1"},
+				Settings:     Settings{},
+				scheme:       "http",
+				HTTPProxyURL: parseURL(t, "http://proxy.example.com:3128"),
+			},
+			"",
+		},
 	}
 
 	for _, testCase := range testCases {
@@ -465,4 +498,10 @@ func TestParseDSN(t *testing.T) {
 			assert.Nil(t, err)
 		})
 	}
+}
+
+func parseURL(t *testing.T, v string) *url.URL {
+	u, err := url.Parse(v)
+	require.NoError(t, err)
+	return u
 }

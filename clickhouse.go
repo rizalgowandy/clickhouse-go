@@ -21,11 +21,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"sync/atomic"
 	"time"
 
 	_ "time/tzdata"
 
+	chproto "github.com/ClickHouse/ch-go/proto"
 	"github.com/ClickHouse/clickhouse-go/v2/contributors"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/column"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -44,10 +46,12 @@ type (
 var (
 	ErrBatchInvalid              = errors.New("clickhouse: batch is invalid. check appended data is correct")
 	ErrBatchAlreadySent          = errors.New("clickhouse: batch has already been sent")
+	ErrBatchNotSent              = errors.New("clickhouse: invalid retry, batch not sent yet")
 	ErrAcquireConnTimeout        = errors.New("clickhouse: acquire conn timeout. you can increase the number of max open conn or the dial timeout")
 	ErrUnsupportedServerRevision = errors.New("clickhouse: unsupported server revision")
 	ErrBindMixedParamsFormats    = errors.New("clickhouse [bind]: mixed named, numeric or positional parameters")
 	ErrAcquireConnNoAddress      = errors.New("clickhouse: no valid address supplied")
+	ErrServerUnexpectedData      = errors.New("code: 101, message: Unexpected packet Data received from client")
 )
 
 type OpError struct {
@@ -151,24 +155,34 @@ func (ch *clickhouse) Exec(ctx context.Context, query string, args ...any) error
 	return nil
 }
 
-func (ch *clickhouse) PrepareBatch(ctx context.Context, query string) (driver.Batch, error) {
+func (ch *clickhouse) PrepareBatch(ctx context.Context, query string, opts ...driver.PrepareBatchOption) (driver.Batch, error) {
 	conn, err := ch.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
-	batch, err := conn.prepareBatch(ctx, query, ch.release)
+	batch, err := conn.prepareBatch(ctx, query, getPrepareBatchOptions(opts...), ch.release, ch.acquire)
 	if err != nil {
 		return nil, err
 	}
 	return batch, nil
 }
 
-func (ch *clickhouse) AsyncInsert(ctx context.Context, query string, wait bool) error {
+func getPrepareBatchOptions(opts ...driver.PrepareBatchOption) driver.PrepareBatchOptions {
+	var options driver.PrepareBatchOptions
+
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	return options
+}
+
+func (ch *clickhouse) AsyncInsert(ctx context.Context, query string, wait bool, args ...any) error {
 	conn, err := ch.acquire(ctx)
 	if err != nil {
 		return err
 	}
-	if err := conn.asyncInsert(ctx, query, wait); err != nil {
+	if err := conn.asyncInsert(ctx, query, wait, args...); err != nil {
 		ch.release(conn, err)
 		return err
 	}
@@ -220,6 +234,7 @@ func (ch *clickhouse) dial(ctx context.Context) (conn *connect, err error) {
 }
 
 func DefaultDialStrategy(ctx context.Context, connID int, opt *Options, dial Dial) (r DialResult, err error) {
+	random := rand.Int()
 	for i := range opt.Addr {
 		var num int
 		switch opt.ConnOpenStrategy {
@@ -227,6 +242,8 @@ func DefaultDialStrategy(ctx context.Context, connID int, opt *Options, dial Dia
 			num = i
 		case ConnOpenRoundRobin:
 			num = (int(connID) + i) % len(opt.Addr)
+		case ConnOpenRandom:
+			num = (random + i) % len(opt.Addr)
 		}
 
 		if r, err = dial(ctx, opt.Addr[num], opt); err == nil {
@@ -252,10 +269,16 @@ func (ch *clickhouse) acquire(ctx context.Context) (conn *connect, err error) {
 	select {
 	case <-timer.C:
 		return nil, ErrAcquireConnTimeout
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	case ch.open <- struct{}{}:
 	}
 	select {
 	case <-timer.C:
+		select {
+		case <-ch.open:
+		default:
+		}
 		return nil, ErrAcquireConnTimeout
 	case conn := <-ch.idle:
 		if conn.isBad() {
@@ -329,6 +352,10 @@ func (ch *clickhouse) release(conn *connect, err error) {
 	if err != nil || time.Since(conn.connectedAt) >= ch.opt.ConnMaxLifetime {
 		conn.close()
 		return
+	}
+	if ch.opt.FreeBufOnConnRelease {
+		conn.buffer = new(chproto.Buffer)
+		conn.compressor.Data = nil
 	}
 	select {
 	case ch.idle <- conn:

@@ -18,163 +18,311 @@
 package std
 
 import (
-	"crypto/tls"
+	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"github.com/ClickHouse/clickhouse-go/v2"
-	clickhouse_tests "github.com/ClickHouse/clickhouse-go/v2/tests"
-	"github.com/stretchr/testify/assert"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/chcol"
 	"github.com/stretchr/testify/require"
-	"strconv"
 	"testing"
 	"time"
 )
 
-type Releases struct {
-	Version string
-}
+var jsonTestDate, _ = time.Parse(time.RFC3339, "2024-12-13T02:09:30.123Z")
 
-type Repository struct {
-	URL      string `json:"url"`
-	Releases []Releases
-}
-
-type Achievement struct {
-	Name string
-}
-
-type Account struct {
-	Id            uint32
-	Name          string
-	Organizations []string `json:"orgs"`
-	Repositories  []Repository
-	Achievement   Achievement
-}
-
-type GithubEvent struct {
-	Title        string
-	Type         string
-	Assignee     Account  `json:"assignee"`
-	Labels       []string `json:"labels"`
-	Contributors []Account
-	// should not be exported
-	createdAt string
-}
-
-var testDate, _ = time.Parse("2006-01-02 15:04:05.999999999 -0700 MST", "2022-05-25 17:20:57 +0100 WEST")
-
-func TestStdJson(t *testing.T) {
-	useSSL, err := strconv.ParseBool(clickhouse_tests.GetEnv("CLICKHOUSE_USE_SSL", "false"))
+func setupJSONTest(t *testing.T) *sql.DB {
+	conn, err := GetStdOpenDBConnection(clickhouse.Native, nil, nil, &clickhouse.Compression{
+		Method: clickhouse.CompressionLZ4,
+	})
 	require.NoError(t, err)
-	var tlsConfig *tls.Config
-	if useSSL {
-		tlsConfig = &tls.Config{}
+
+	if !CheckMinServerVersion(conn, 24, 9, 0) {
+		t.Skip(fmt.Errorf("unsupported clickhouse version for JSON type"))
+		return nil
 	}
-	conn, err := GetStdDSNConnection(clickhouse.Native, useSSL, nil)
-	require.NoError(t, err)
-	if !CheckMinServerVersion(conn, 22, 6, 1) {
-		t.Skip(fmt.Errorf("unsupported clickhouse version"))
-		return
+
+	_, err = conn.ExecContext(context.Background(), "SET allow_experimental_json_type = 1")
+	if err != nil {
+		t.Fatal(err)
+		return nil
 	}
-	conn.Close()
-	conn, err = GetStdOpenDBConnection(clickhouse.Native, clickhouse.Settings{
-		"allow_experimental_object_type": 1,
-	}, tlsConfig, nil)
-	require.NoError(t, err)
-	conn.Exec("DROP TABLE json_std_test")
+
+	return conn
+}
+
+func TestJSONPaths(t *testing.T) {
+	ctx := context.Background()
+	conn := setupJSONTest(t)
+
 	const ddl = `
-		CREATE TABLE json_std_test (
-			  event JSON
-		) Engine MergeTree() ORDER BY tuple()
+			CREATE TABLE IF NOT EXISTS test_json (
+				  c JSON(Name String, Age Int64, KeysNumbers Map(String, Int64), SKIP fake.field)
+			) Engine = MergeTree() ORDER BY tuple()
 		`
+	_, err := conn.ExecContext(ctx, ddl)
+	require.NoError(t, err)
 	defer func() {
-		conn.Exec("DROP TABLE json_std_test")
+		_, err := conn.ExecContext(ctx, "DROP TABLE IF EXISTS test_json")
+		require.NoError(t, err)
 	}()
-	_, err = conn.Exec(ddl)
+
+	tx, err := conn.BeginTx(ctx, nil)
 	require.NoError(t, err)
-	scope, err := conn.Begin()
+
+	batch, err := tx.PrepareContext(ctx, "INSERT INTO test_json (c)")
 	require.NoError(t, err)
-	batch, err := scope.Prepare("INSERT INTO json_std_test")
+
+	jsonRow := chcol.NewJSON()
+	jsonRow.SetValueAtPath("Name", "JSON")
+	jsonRow.SetValueAtPath("Age", int64(42))
+	jsonRow.SetValueAtPath("Active", true)
+	jsonRow.SetValueAtPath("Score", 3.14)
+	jsonRow.SetValueAtPath("Tags", []string{"a", "b"})
+	jsonRow.SetValueAtPath("Numbers", []int64{20, 40})
+	jsonRow.SetValueAtPath("Address.Street", "Street")
+	jsonRow.SetValueAtPath("Address.City", "City")
+	jsonRow.SetValueAtPath("Address.Country", "Country")
+	jsonRow.SetValueAtPath("KeysNumbers", map[string]int64{"FieldA": 42, "FieldB": 32})
+	jsonRow.SetValueAtPath("Metadata.FieldA", "a")
+	jsonRow.SetValueAtPath("Metadata.FieldB", "b")
+	jsonRow.SetValueAtPath("Metadata.FieldC.FieldD", "d")
+	jsonRow.SetValueAtPath("Timestamp", jsonTestDate)
+	jsonRow.SetValueAtPath("DynamicString", clickhouse.NewDynamic("str"))
+	jsonRow.SetValueAtPath("DynamicInt", clickhouse.NewDynamic(int64(48)))
+	jsonRow.SetValueAtPath("DynamicMap", clickhouse.NewDynamic(map[string]string{"a": "a", "b": "b"}))
+
+	_, err = batch.ExecContext(ctx, jsonRow)
 	require.NoError(t, err)
-	col1Data := GithubEvent{
-		Title: "Document JSON support",
-		Type:  "Issue",
-		Assignee: Account{
-			Id:            1244,
-			Name:          "Geoff",
-			Achievement:   Achievement{Name: "Mars Star"},
-			Repositories:  []Repository{{URL: "https://github.com/ClickHouse/clickhouse-python", Releases: []Releases{{Version: "1.0.0"}, {Version: "1.1.0"}}}, {URL: "https://github.com/ClickHouse/clickhouse-go", Releases: []Releases{{Version: "2.0.0"}, {Version: "2.1.0"}}}},
-			Organizations: []string{"Support Engineer", "Integrations"},
-		},
-		Labels: []string{"Help wanted"},
-		Contributors: []Account{
-			{Id: 2244, Achievement: Achievement{Name: "Adding JSON to go driver"}, Organizations: []string{"Support Engineer", "Consulting", "PM", "Integrations"}, Name: "Dale", Repositories: []Repository{{URL: "https://github.com/ClickHouse/clickhouse-go", Releases: []Releases{{Version: "2.0.0"}, {Version: "2.1.0"}}}, {URL: "https://github.com/grafana/clickhouse", Releases: []Releases{{Version: "1.2.0"}, {Version: "1.3.0"}}}}},
-			{Id: 2344, Achievement: Achievement{Name: "Managing S3 buckets"}, Organizations: []string{"Support Engineer", "Consulting"}, Name: "Melyvn", Repositories: []Repository{{URL: "https://github.com/ClickHouse/support", Releases: []Releases{{Version: "1.0.0"}, {Version: "2.3.0"}, {Version: "2.4.0"}}}}},
-		},
+
+	require.NoError(t, tx.Commit())
+
+	rows, err := conn.QueryContext(ctx, "SELECT c FROM test_json")
+	require.NoError(t, err)
+
+	var row chcol.JSON
+
+	require.True(t, rows.Next())
+	err = rows.Scan(&row)
+	require.NoError(t, err)
+
+	expectedValuesByPath := jsonRow.ValuesByPath()
+	actualValuesByPath := row.ValuesByPath()
+	for path, expectedValue := range expectedValuesByPath {
+		actualValue, ok := actualValuesByPath[path]
+		if !ok {
+			t.Fatalf("result JSON is missing path: %s", path)
+		}
+
+		// Allow Equal func to compare values without Dynamic wrapper
+		if v, ok := expectedValue.(clickhouse.Dynamic); ok {
+			expectedValue = v.Any()
+		}
+
+		if v, ok := actualValue.(clickhouse.Dynamic); ok {
+			actualValue = v.Any()
+		}
+
+		require.Equal(t, expectedValue, actualValue)
 	}
-	_, err = batch.Exec(col1Data)
-	require.NoError(t, err)
-	require.NoError(t, scope.Commit())
-	// must pass any - maps must be strongly typed so map[string]any wont work - it wont convert
-	var event any
-	rows := conn.QueryRow("SELECT * FROM json_std_test")
-	require.NoError(t, rows.Scan(&event))
-	assert.JSONEq(t, ToJson(col1Data), ToJson(event))
-	// again pass any for anthing other than primitives
-	rows = conn.QueryRow("SELECT event.assignee.Achievement FROM json_std_test")
-	var achievement any
-	require.NoError(t, rows.Scan(&achievement))
-	assert.JSONEq(t, ToJson(col1Data.Assignee.Achievement), ToJson(achievement))
-	rows = conn.QueryRow("SELECT event.assignee.Repositories FROM json_std_test")
-	var repositories any
-	require.NoError(t, rows.Scan(&repositories))
-	assert.JSONEq(t, ToJson(col1Data.Assignee.Repositories), ToJson(repositories))
 }
 
-// https://github.com/ClickHouse/clickhouse-go/issues/645
-func TestStdJsonWithMap(t *testing.T) {
-	useSSL, err := strconv.ParseBool(clickhouse_tests.GetEnv("CLICKHOUSE_USE_SSL", "false"))
-	require.NoError(t, err)
-	var tlsConfig *tls.Config
-	if useSSL {
-		tlsConfig = &tls.Config{}
-	}
-	conn, err := GetStdDSNConnection(clickhouse.Native, useSSL, nil)
-	require.NoError(t, err)
-	if !CheckMinServerVersion(conn, 22, 6, 1) {
-		t.Skip(fmt.Errorf("unsupported clickhouse version"))
-		return
-	}
-	conn.Close()
-	conn, err = GetStdOpenDBConnection(clickhouse.Native, clickhouse.Settings{
-		"allow_experimental_object_type": 1,
-	}, tlsConfig, nil)
-	require.NoError(t, err)
-	conn.Exec("DROP TABLE json_std_test")
+type Address struct {
+	Street  string `chType:"String"`
+	City    string `chType:"String"`
+	Country string `chType:"String"`
+}
+
+type TestStruct struct {
+	Name   string
+	Age    int64
+	Active bool
+	Score  float64
+
+	Tags    []string
+	Numbers []int64
+
+	Address Address
+
+	KeysNumbers map[string]int64
+	Metadata    map[string]interface{}
+
+	Timestamp time.Time `chType:"DateTime64(3)"`
+
+	DynamicString chcol.Dynamic
+	DynamicInt    chcol.Dynamic
+	DynamicMap    chcol.Dynamic
+}
+
+func TestJSONStruct(t *testing.T) {
+	t.Skip("scan skips struct reflection")
+
+	ctx := context.Background()
+	conn := setupJSONTest(t)
+
 	const ddl = `
-		CREATE TABLE json_std_test (
-			  event JSON
-		) Engine MergeTree() ORDER BY tuple()
+			CREATE TABLE IF NOT EXISTS test_json (
+				  c JSON(Name String, Age Int64, KeysNumbers Map(String, Int64), SKIP fake.field)
+			) Engine = MergeTree() ORDER BY tuple()
 		`
+	_, err := conn.ExecContext(ctx, ddl)
+	require.NoError(t, err)
 	defer func() {
-		conn.Exec("DROP TABLE json_std_test")
+		_, err := conn.ExecContext(ctx, "DROP TABLE IF EXISTS test_json")
+		require.NoError(t, err)
 	}()
-	_, err = conn.Exec(ddl)
+
+	tx, err := conn.BeginTx(ctx, nil)
 	require.NoError(t, err)
-	scope, err := conn.Begin()
+
+	batch, err := tx.PrepareContext(ctx, "INSERT INTO test_json (c)")
 	require.NoError(t, err)
-	batch, err := scope.Prepare("INSERT INTO json_std_test")
+
+	inputRow := TestStruct{
+		Name:    "JSON",
+		Age:     42,
+		Active:  true,
+		Score:   3.14,
+		Tags:    []string{"a", "b"},
+		Numbers: []int64{20, 40},
+		Address: Address{
+			Street:  "Street",
+			City:    "City",
+			Country: "Country",
+		},
+		KeysNumbers: map[string]int64{"FieldA": 42, "FieldB": 32},
+		Metadata: map[string]interface{}{
+			"FieldA": "a",
+			"FieldB": "b",
+			"FieldC": map[string]interface{}{
+				"FieldD": "d",
+			},
+		},
+		Timestamp:     jsonTestDate,
+		DynamicString: chcol.NewDynamic("str").WithType("String"),
+		DynamicInt:    chcol.NewDynamic(int64(48)).WithType("Int64"),
+		DynamicMap:    chcol.NewDynamic(map[string]string{"a": "a", "b": "b"}).WithType("Map(String, String)"),
+	}
+	_, err = batch.ExecContext(ctx, inputRow)
 	require.NoError(t, err)
-	col1Data := map[string]any{
-		"58": map[string]any{
-			"test": []string{"2", "3"},
+
+	inputRow2 := TestStruct{
+		KeysNumbers: map[string]int64{},
+		Timestamp:   jsonTestDate,
+		Metadata: map[string]interface{}{
+			"FieldA": "a",
+			"FieldB": "b",
+			"FieldC": map[string]interface{}{
+				"FieldD": int64(5),
+			},
+			"FieldE": map[string]interface{}{
+				"FieldF": "f",
+			},
 		},
 	}
-	_, err = batch.Exec(col1Data)
+	_, err = batch.ExecContext(ctx, inputRow2)
 	require.NoError(t, err)
-	require.NoError(t, scope.Commit())
-	// must pass any - maps must be strongly typed so map[string]any wont work - it wont convert
-	var event any
-	rows := conn.QueryRow("SELECT * FROM json_std_test")
-	require.NoError(t, rows.Scan(&event))
-	assert.JSONEq(t, ToJson(col1Data), ToJson(event))
+
+	require.NoError(t, tx.Commit())
+
+	rows, err := conn.QueryContext(ctx, "SELECT c FROM test_json")
+	require.NoError(t, err)
+
+	var row TestStruct
+
+	require.True(t, rows.Next())
+	err = rows.Scan(&row)
+	require.NoError(t, err)
+	// The second row adds a nil value at this path. Update the inputRow for easier deep equal check
+	inputRow.Metadata["FieldE"] = map[string]interface{}{
+		"FieldF": nil,
+	}
+	require.Equal(t, inputRow, row)
+
+	var row2 TestStruct
+
+	require.True(t, rows.Next())
+	err = rows.Scan(&row2)
+	require.NoError(t, err)
+	// Init slices for easier comparison
+	inputRow2.Tags = make([]string, 0)
+	inputRow2.Numbers = make([]int64, 0)
+	require.Equal(t, inputRow2, row2)
+}
+
+func TestJSONString(t *testing.T) {
+	t.Skip("client cannot receive JSON strings")
+
+	ctx := context.Background()
+	conn := setupJSONTest(t)
+
+	_, err := conn.ExecContext(ctx, "SET output_format_native_write_json_as_string = 1")
+	require.NoError(t, err)
+
+	const ddl = `
+			CREATE TABLE IF NOT EXISTS test_json (
+				  c JSON(Name String, Age Int64, KeysNumbers Map(String, Int64), SKIP fake.field)
+			) Engine = MergeTree() ORDER BY tuple()
+		`
+	_, err = conn.ExecContext(ctx, ddl)
+	require.NoError(t, err)
+	defer func() {
+		_, err := conn.ExecContext(ctx, "DROP TABLE IF EXISTS test_json")
+		require.NoError(t, err)
+	}()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	require.NoError(t, err)
+
+	batch, err := tx.PrepareContext(ctx, "INSERT INTO test_json (c)")
+	require.NoError(t, err)
+
+	inputRow := TestStruct{
+		Name:    "JSON",
+		Age:     42,
+		Active:  true,
+		Score:   3.14,
+		Tags:    []string{"a", "b"},
+		Numbers: []int64{20, 40},
+		Address: Address{
+			Street:  "Street",
+			City:    "City",
+			Country: "Country",
+		},
+		KeysNumbers: map[string]int64{"FieldA": 42, "FieldB": 32},
+		Metadata: map[string]interface{}{
+			"FieldA": "a",
+			"FieldB": "b",
+			"FieldC": map[string]interface{}{
+				"FieldD": "d",
+			},
+		},
+		Timestamp:     jsonTestDate,
+		DynamicString: chcol.NewDynamic("str").WithType("String"),
+		DynamicInt:    chcol.NewDynamic(int64(48)).WithType("Int64"),
+		DynamicMap:    chcol.NewDynamic(map[string]string{"a": "a", "b": "b"}).WithType("Map(String, String)"),
+	}
+
+	inputRowStr, err := json.Marshal(inputRow)
+	require.NoError(t, err)
+
+	_, err = batch.ExecContext(ctx, inputRowStr)
+	require.NoError(t, err)
+
+	require.NoError(t, tx.Commit())
+
+	rows, err := conn.QueryContext(ctx, "SELECT c FROM test_json")
+	require.NoError(t, err)
+
+	var row json.RawMessage
+
+	require.True(t, rows.Next())
+	err = rows.Scan(&row)
+	require.NoError(t, err)
+
+	require.Equal(t, string(inputRowStr), string(row))
+
+	var rowStruct TestStruct
+	err = json.Unmarshal(row, &rowStruct)
+	require.NoError(t, err)
 }

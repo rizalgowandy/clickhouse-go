@@ -26,11 +26,12 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"log"
 	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -74,49 +75,32 @@ type HTTPReaderWriter struct {
 	method CompressionMethod
 }
 
-func (rw HTTPReaderWriter) read(res *http.Response) ([]byte, error) {
+// NewReader will return a reader that will decompress data if needed.
+func (rw *HTTPReaderWriter) NewReader(res *http.Response) (io.Reader, error) {
 	enc := res.Header.Get("Content-Encoding")
 	if !res.Uncompressed && rw.method.String() == enc {
 		switch rw.method {
 		case CompressionGZIP:
 			reader := rw.reader.(*gzip.Reader)
-			defer reader.Close()
 			if err := reader.Reset(res.Body); err != nil {
 				return nil, err
 			}
-			body, err := ioutil.ReadAll(reader)
-			if err != nil {
-				return nil, err
-			}
-			return body, nil
+			return reader, nil
 		case CompressionDeflate:
-			reader := rw.reader.(io.ReadCloser)
-			defer reader.Close()
-			if err := rw.reader.(flate.Resetter).Reset(res.Body, nil); err != nil {
+			reader := rw.reader
+			if err := reader.(flate.Resetter).Reset(res.Body, nil); err != nil {
 				return nil, err
 			}
-			body, err := ioutil.ReadAll(reader)
-			if err != nil {
-				return nil, err
-			}
-			return body, nil
+			return reader, nil
 		case CompressionBrotli:
 			reader := rw.reader.(*brotli.Reader)
 			if err := reader.Reset(res.Body); err != nil {
 				return nil, err
 			}
-			body, err := ioutil.ReadAll(reader)
-			if err != nil {
-				return nil, err
-			}
-			return body, nil
+			return reader, nil
 		}
 	}
-	body, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		return nil, err
-	}
-	return body, nil
+	return res.Body, nil
 }
 
 func (rw *HTTPReaderWriter) reset(pw *io.PipeWriter) io.WriteCloser {
@@ -136,6 +120,20 @@ func (rw *HTTPReaderWriter) reset(pw *io.PipeWriter) io.WriteCloser {
 }
 
 func dialHttp(ctx context.Context, addr string, num int, opt *Options) (*httpConnect, error) {
+	var debugf = func(format string, v ...any) {}
+	if opt.Debug {
+		if opt.Debugf != nil {
+			debugf = func(format string, v ...any) {
+				opt.Debugf(
+					"[clickhouse][conn=%d][%s] "+format,
+					append([]interface{}{num, addr}, v...)...,
+				)
+			}
+		} else {
+			debugf = log.New(os.Stdout, fmt.Sprintf("[clickhouse][conn=%d][%s]", num, addr), 0).Printf
+		}
+	}
+
 	if opt.scheme == "" {
 		switch opt.Protocol {
 		case HTTP:
@@ -168,6 +166,9 @@ func dialHttp(ctx context.Context, addr string, num int, opt *Options) (*httpCon
 		headers["X-ClickHouse-User"] = opt.Auth.Username
 		if len(opt.Auth.Password) > 0 {
 			headers["X-ClickHouse-Key"] = opt.Auth.Password
+			headers["X-ClickHouse-SSL-Certificate-Auth"] = "off"
+		} else {
+			headers["X-ClickHouse-SSL-Certificate-Auth"] = "on"
 		}
 	}
 
@@ -200,8 +201,13 @@ func dialHttp(ctx context.Context, addr string, num int, opt *Options) (*httpCon
 	query.Set("default_format", "Native")
 	u.RawQuery = query.Encode()
 
+	httpProxy := http.ProxyFromEnvironment
+	if opt.HTTPProxyURL != nil {
+		httpProxy = http.ProxyURL(opt.HTTPProxyURL)
+	}
+
 	t := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
+		Proxy: httpProxy,
 		DialContext: (&net.Dialer{
 			Timeout: opt.DialTimeout,
 		}).DialContext,
@@ -239,7 +245,7 @@ func dialHttp(ctx context.Context, addr string, num int, opt *Options) (*httpCon
 			return nil, err
 		}
 		if !resources.ClientMeta.IsSupportedClickHouseVersion(version) {
-			fmt.Printf("WARNING: version %v of ClickHouse is not supported by this client\n", version)
+			debugf("WARNING: version %v of ClickHouse is not supported by this client\n", version)
 		}
 	}
 
@@ -379,11 +385,10 @@ func (h *httpConnect) writeData(block *proto.Block) error {
 	return nil
 }
 
-func (h *httpConnect) readData(ctx context.Context, reader *chproto.Reader) (*proto.Block, error) {
-	opts := queryOptions(ctx)
+func (h *httpConnect) readData(reader *chproto.Reader, timezone *time.Location) (*proto.Block, error) {
 	location := h.location
-	if opts.userLocation != nil {
-		location = opts.userLocation
+	if timezone != nil {
+		location = timezone
 	}
 
 	block := proto.Block{Timezone: location}
@@ -426,27 +431,21 @@ func (h *httpConnect) sendQuery(ctx context.Context, query string, options *Quer
 
 func (h *httpConnect) readRawResponse(response *http.Response) (body []byte, err error) {
 	rw := h.compressionPool.Get()
-	defer response.Body.Close()
 	defer h.compressionPool.Put(rw)
-	if body, err = rw.read(response); err != nil {
+
+	reader, err := rw.NewReader(response)
+	if err != nil {
 		return nil, err
 	}
 	if h.compression == CompressionLZ4 || h.compression == CompressionZSTD {
-		result := make([]byte, len(body))
-		reader := chproto.NewReader(bytes.NewReader(body))
-		reader.EnableCompression()
-		defer reader.DisableCompression()
-		for {
-			b, err := reader.ReadByte()
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					break
-				}
-				return nil, err
-			}
-			result = append(result, b)
-		}
-		return result, nil
+		chReader := chproto.NewReader(reader)
+		chReader.EnableCompression()
+		reader = chReader
+	}
+
+	body, err = io.ReadAll(reader)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
 	}
 	return body, nil
 }
@@ -539,14 +538,13 @@ func (h *httpConnect) executeRequest(req *http.Request) (*http.Response, error) 
 	if err != nil {
 		return nil, err
 	}
+
 	if resp.StatusCode != http.StatusOK {
-
+		defer resp.Body.Close()
 		msg, err := h.readRawResponse(resp)
-
 		if err != nil {
-			return nil, errors.Wrap(err, "clickhouse [execute]:: failed to read the response")
+			return nil, fmt.Errorf("clickhouse [execute]:: %d code: failed to read the response: %w", resp.StatusCode, err)
 		}
-
 		return nil, fmt.Errorf("clickhouse [execute]:: %d code: %s", resp.StatusCode, string(msg))
 	}
 	return resp, nil

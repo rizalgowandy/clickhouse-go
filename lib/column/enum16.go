@@ -19,6 +19,7 @@ package column
 
 import (
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"github.com/ClickHouse/ch-go/proto"
 	"reflect"
@@ -30,6 +31,10 @@ type Enum16 struct {
 	chType Type
 	col    proto.ColEnum16
 	name   string
+
+	continuous bool
+	minEnum    int16
+	maxEnum    int16
 }
 
 func (col *Enum16) Reset() {
@@ -153,6 +158,24 @@ func (col *Enum16) Append(v any) (nulls []uint8, err error) {
 				nulls[i] = 1
 			}
 		}
+	default:
+		if valuer, ok := v.(driver.Valuer); ok {
+			val, err := valuer.Value()
+			if err != nil {
+				return nil, &ColumnConverterError{
+					Op:   "Append",
+					To:   "Enum16",
+					From: fmt.Sprintf("%T", v),
+					Hint: "could not get driver.Valuer value",
+				}
+			}
+			return col.Append(val)
+		}
+		return nil, &ColumnConverterError{
+			Op:   "Append",
+			To:   "Enum16",
+			From: fmt.Sprintf("%T", v),
+		}
 	}
 	return
 }
@@ -160,9 +183,17 @@ func (col *Enum16) Append(v any) (nulls []uint8, err error) {
 func (col *Enum16) AppendRow(elem any) error {
 	switch elem := elem.(type) {
 	case int16:
-		return col.AppendRow(int(elem))
+		if col.continuous && elem >= col.minEnum && elem <= col.maxEnum {
+			col.col.Append(proto.Enum16(elem))
+		} else {
+			return col.AppendRow(int(elem))
+		}
 	case *int16:
-		return col.AppendRow(int(*elem))
+		if col.continuous && *elem >= col.minEnum && *elem <= col.maxEnum {
+			col.col.Append(proto.Enum16(*elem))
+		} else {
+			return col.AppendRow(int(*elem))
+		}
 	case int:
 		v := proto.Enum16(elem)
 		_, ok := col.vi[v]
@@ -214,6 +245,18 @@ func (col *Enum16) AppendRow(elem any) error {
 	case nil:
 		col.col.Append(0)
 	default:
+		if valuer, ok := elem.(driver.Valuer); ok {
+			val, err := valuer.Value()
+			if err != nil {
+				return &ColumnConverterError{
+					Op:   "AppendRow",
+					To:   "Enum16",
+					From: fmt.Sprintf("%T", elem),
+					Hint: "could not get driver.Valuer value",
+				}
+			}
+			return col.AppendRow(val)
+		}
 		if s, ok := elem.(fmt.Stringer); ok {
 			return col.AppendRow(s.String())
 		} else {

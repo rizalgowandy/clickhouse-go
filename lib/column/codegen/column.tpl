@@ -31,7 +31,9 @@ import (
 	"github.com/paulmach/orb"
 	"github.com/shopspring/decimal"
 	"database/sql"
+	"database/sql/driver"
 	"github.com/ClickHouse/ch-go/proto"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/chcol"
 )
 
 func (t Type) Column(name string, tz *time.Location) (Interface, error) {
@@ -119,7 +121,9 @@ func (t Type) Column(name string, tz *time.Location) (Interface, error) {
 	case "Point":
 		return &Point{name: name}, nil
 	case "String":
-		return &String{name: name}, nil
+		return &String{name: name, col: colStrProvider()}, nil
+    case "SharedVariant":
+        return &SharedVariant{name: name}, nil
 	case "Object('json')":
 	    return &JSONObject{name: name, root: true, tz: tz}, nil
 	}
@@ -129,6 +133,12 @@ func (t Type) Column(name string, tz *time.Location) (Interface, error) {
 		return (&Map{name: name}).parse(t, tz)
 	case strings.HasPrefix(string(t), "Tuple("):
 		return (&Tuple{name: name}).parse(t, tz)
+	case strings.HasPrefix(string(t), "Variant("):
+		return (&Variant{name: name}).parse(t, tz)
+	case strings.HasPrefix(string(t), "Dynamic"):
+		return (&Dynamic{name: name}).parse(t, tz)
+	case strings.HasPrefix(string(t), "JSON"):
+		return (&JSON{name: name}).parse(t, tz)
 	case strings.HasPrefix(string(t), "Decimal("):
 		return (&Decimal{name: name}).parse(t)
 	case strings.HasPrefix(strType, "Nested("):
@@ -190,6 +200,9 @@ var (
 		scanTypePolygon = reflect.TypeOf(orb.Polygon{})
 		scanTypeDecimal = reflect.TypeOf(decimal.Decimal{})
 		scanTypeMultiPolygon = reflect.TypeOf(orb.MultiPolygon{})
+		scanTypeVariant = reflect.TypeOf(chcol.Variant{})
+		scanTypeDynamic = reflect.TypeOf(chcol.Dynamic{})
+        scanTypeJSON    = reflect.TypeOf(chcol.JSON{})
 	)
 
 {{- range . }}
@@ -230,7 +243,7 @@ func (col *{{ .ChType }}) ScanRow(dest any, row int) error {
 	case *sql.Null{{ .ChType }}:
 		return d.Scan(value)
 	{{- end }}
-    {{- if eq .ChType "Int8" }}
+    {{- if or (eq .ChType "Int8") (eq .ChType "UInt8")  }}
 	case *bool:
 		switch value {
 		case 0:
@@ -308,13 +321,29 @@ func (col *{{ .ChType }}) Append(v any) (nulls []uint8,err error) {
 		nulls = make([]uint8, len(v))
 		for i := range v {
 			val := int8(0)
-			if *v[i] {
+			if v[i] == nil {
+				nulls[i] = 1
+			} else if *v[i] {
 				val = 1
 			}
 			col.col.Append(val)
 		}
 	{{- end }}
 	default:
+
+	    if valuer, ok := v.(driver.Valuer); ok {
+            val, err := valuer.Value()
+            if err != nil {
+                return nil, &ColumnConverterError{
+                    Op:   "Append",
+                    To:   "{{ .ChType }}",
+                    From: fmt.Sprintf("%T", v),
+                    Hint: "could not get driver.Valuer value",
+                }
+            }
+            return col.Append(val)
+        }
+
 		return nil, &ColumnConverterError{
 			Op:   "Append",
 			To:   "{{ .ChType }}",
@@ -382,7 +411,21 @@ func (col *{{ .ChType }}) AppendRow(v any) error {
         col.col.Append(val)
 	{{- end }}
 	default:
-		if rv := reflect.ValueOf(v); rv.Kind() == col.ScanType().Kind() && rv.CanConvert(col.ScanType()) {
+
+	    if valuer, ok := v.(driver.Valuer); ok {
+            val, err := valuer.Value()
+            if err != nil {
+                return &ColumnConverterError{
+                    Op:   "AppendRow",
+                    To:   "{{ .ChType }}",
+                    From: fmt.Sprintf("%T", v),
+                    Hint: "could not get driver.Valuer value",
+                }
+            }
+            return col.AppendRow(val)
+        }
+
+		if rv := reflect.ValueOf(v); rv.Kind() == col.ScanType().Kind() || rv.CanConvert(col.ScanType()) {
 			col.col.Append(rv.Convert(col.ScanType()).Interface().({{ .GoType }}))
 		} else {
 			return &ColumnConverterError{

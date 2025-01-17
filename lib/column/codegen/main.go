@@ -32,15 +32,24 @@ import (
 var (
 	//go:embed column.tpl
 	columnSrc string
+	//go:embed array.tpl
+	arraySrc string
+	//go:embed dynamic.tpl
+	dynamicSrc string
 )
 var (
-	types []_type
+	types            []_type
+	supportedGoTypes []string
+	dynamicTypes     []_type
 )
 
 type _type struct {
-	Size   int
+	Size int
+
 	ChType string
 	GoType string
+
+	SkipArray bool
 }
 
 func init() {
@@ -65,6 +74,51 @@ func init() {
 	sort.Slice(types, func(i, j int) bool {
 		return sequenceKey(types[i].ChType) < sequenceKey(types[j].ChType)
 	})
+
+	for _, typ := range types {
+		supportedGoTypes = append(supportedGoTypes, typ.GoType)
+	}
+
+	supportedGoTypes = append(supportedGoTypes,
+		"string", "[]byte", "sql.NullString",
+		"int", "uint", "big.Int", "decimal.Decimal",
+		"bool", "sql.NullBool",
+		"time.Time", "sql.NullTime",
+		"uuid.UUID",
+		"netip.Addr", "net.IP", "proto.IPv6", "[16]byte",
+		"orb.MultiPolygon", "orb.Point", "orb.Polygon", "orb.Ring",
+	)
+
+	dynamicTypes = make([]_type, 0, len(types))
+	for _, typ := range types {
+
+		if typ.GoType == "uint8" {
+			// Prevent conflict with []byte and []uint8
+			typ.SkipArray = true
+			dynamicTypes = append(dynamicTypes, typ)
+			continue
+		}
+
+		dynamicTypes = append(dynamicTypes, typ)
+	}
+
+	// Best-effort type matching for Dynamic inference
+	dynamicTypes = append(dynamicTypes, []_type{
+		{ChType: "String", GoType: "string"},
+		{ChType: "String", GoType: "json.RawMessage"},
+		{ChType: "String", GoType: "sql.NullString"},
+		{ChType: "Bool", GoType: "bool"},
+		{ChType: "Bool", GoType: "sql.NullBool"},
+		{ChType: "DateTime64(3)", GoType: "time.Time"},
+		{ChType: "DateTime64(3)", GoType: "sql.NullTime"},
+		{ChType: "UUID", GoType: "uuid.UUID"},
+		{ChType: "IPv6", GoType: "proto.IPv6"},
+		{ChType: "MultiPolygon", GoType: "orb.MultiPolygon"},
+		{ChType: "Point", GoType: "orb.Point"},
+		{ChType: "Polygon", GoType: "orb.Polygon"},
+		{ChType: "Ring", GoType: "orb.Ring"},
+	}...)
+
 }
 func write(name string, v any, t *template.Template) error {
 	out := new(bytes.Buffer)
@@ -87,10 +141,15 @@ func write(name string, v any, t *template.Template) error {
 }
 
 func main() {
-	for name, tpl := range map[string]*template.Template{
-		"column_gen": template.Must(template.New("column").Parse(columnSrc)),
+	for name, tpl := range map[string]struct {
+		template *template.Template
+		args     any
+	}{
+		"column_gen":  {template.Must(template.New("column").Parse(columnSrc)), types},
+		"array_gen":   {template.Must(template.New("array").Parse(arraySrc)), supportedGoTypes},
+		"dynamic_gen": {template.Must(template.New("dynamic").Parse(dynamicSrc)), dynamicTypes},
 	} {
-		if err := write(name, types, tpl); err != nil {
+		if err := write(name, tpl.args, tpl.template); err != nil {
 			log.Fatal(err)
 		}
 	}
